@@ -16,6 +16,8 @@ package wire
 
 import (
     "context"
+    "crypto/sha256"
+    "encoding/hex"
     "errors"
     "fmt"
     "go/ast"
@@ -25,6 +27,8 @@ import (
     "reflect"
     "strconv"
     "strings"
+    "sync"
+    "time"
 
     "golang.org/x/tools/go/ast/astutil"
     "golang.org/x/tools/go/packages"
@@ -393,6 +397,167 @@ func load(ctx context.Context, wd string, env []string, tags string, patterns []
         return nil, errs
     }
     return pkgs, nil
+}
+
+// ProviderSetCache provides incremental compilation support by caching
+// analyzed provider sets. This significantly improves performance for
+// repeated builds where only a subset of files have changed.
+type ProviderSetCache struct {
+    mu          sync.RWMutex
+    sets        map[string]*cachedProviderSet // key: pkgPath + ":" + varName
+    fileModTime map[string]time.Time          // file path -> mod time (fast check)
+    fileHash    map[string]string             // file path -> content hash (fallback)
+}
+
+type cachedProviderSet struct {
+    set       *ProviderSet
+    timestamp time.Time
+}
+
+// NewProviderSetCache creates a new cache for provider sets.
+func NewProviderSetCache() *ProviderSetCache {
+    return &ProviderSetCache{
+        sets:        make(map[string]*cachedProviderSet),
+        fileModTime: make(map[string]time.Time),
+        fileHash:    make(map[string]string),
+    }
+}
+
+// globalCache is a package-level cache for provider sets.
+// It's safe for concurrent use.
+var globalCache = NewProviderSetCache()
+
+// GetGlobalCache returns the global provider set cache.
+func GetGlobalCache() *ProviderSetCache {
+    return globalCache
+}
+
+// GetCachedSet retrieves a cached provider set if it's still valid.
+// It uses a two-level check: first mod time (fast), then content hash (accurate).
+func (c *ProviderSetCache) GetCachedSet(pkgPath, varName string, files []string) (*ProviderSet, bool) {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+
+    key := pkgPath + ":" + varName
+    cached, ok := c.sets[key]
+    if !ok {
+        return nil, false
+    }
+
+    // Fast path: check file modification times
+    for _, f := range files {
+        info, err := os.Stat(f)
+        if err != nil {
+            return nil, false
+        }
+        cachedModTime, ok := c.fileModTime[f]
+        if !ok || !cachedModTime.Equal(info.ModTime()) {
+            // Mod time changed, need to verify with hash
+            hash, err := computeFileHash(f)
+            if err != nil {
+                return nil, false
+            }
+            if cachedHash, ok := c.fileHash[f]; !ok || cachedHash != hash {
+                return nil, false
+            }
+        }
+    }
+
+    return cached.set, true
+}
+
+// GetCachedSetFast retrieves a cached provider set using only mod time check.
+// This is faster but may have false negatives if file was touched without changes.
+func (c *ProviderSetCache) GetCachedSetFast(pkgPath, varName string, files []string) (*ProviderSet, bool) {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+
+    key := pkgPath + ":" + varName
+    cached, ok := c.sets[key]
+    if !ok {
+        return nil, false
+    }
+
+    // Only check file modification times
+    for _, f := range files {
+        info, err := os.Stat(f)
+        if err != nil {
+            return nil, false
+        }
+        cachedModTime, ok := c.fileModTime[f]
+        if !ok || !cachedModTime.Equal(info.ModTime()) {
+            return nil, false
+        }
+    }
+
+    return cached.set, true
+}
+
+// CacheSet stores a provider set in the cache.
+func (c *ProviderSetCache) CacheSet(pkgPath, varName string, set *ProviderSet, files []string) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    key := pkgPath + ":" + varName
+
+    // Update file mod times and hashes
+    for _, f := range files {
+        info, err := os.Stat(f)
+        if err != nil {
+            continue
+        }
+        c.fileModTime[f] = info.ModTime()
+
+        hash, err := computeFileHash(f)
+        if err != nil {
+            continue
+        }
+        c.fileHash[f] = hash
+    }
+
+    c.sets[key] = &cachedProviderSet{
+        set:       set,
+        timestamp: time.Now(),
+    }
+}
+
+// InvalidatePackage removes all cached sets for a given package.
+func (c *ProviderSetCache) InvalidatePackage(pkgPath string) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    prefix := pkgPath + ":"
+    for key := range c.sets {
+        if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+            delete(c.sets, key)
+        }
+    }
+}
+
+// Clear removes all cached entries.
+func (c *ProviderSetCache) Clear() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    c.sets = make(map[string]*cachedProviderSet)
+    c.fileHash = make(map[string]string)
+}
+
+// Stats returns cache statistics for monitoring.
+func (c *ProviderSetCache) Stats() (setCount int, fileCount int) {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    return len(c.sets), len(c.fileHash)
+}
+
+// computeFileHash computes a SHA256 hash of a file's contents.
+func computeFileHash(path string) (string, error) {
+    content, err := os.ReadFile(path)
+    if err != nil {
+        return "", err
+    }
+    hash := sha256.Sum256(content)
+    return hex.EncodeToString(hash[:]), nil
 }
 
 // Info holds the result of Load.

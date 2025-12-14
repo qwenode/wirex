@@ -30,6 +30,7 @@ import (
     "sort"
     "strconv"
     "strings"
+    "time"
 
     "github.com/google/subcommands"
     "github.com/google/wire/internal/wire"
@@ -37,6 +38,7 @@ import (
     "golang.org/x/tools/go/types/typeutil"
 )
 
+//go:generate go install .
 func main() {
     subcommands.Register(subcommands.CommandsCommand(), "")
     subcommands.Register(subcommands.FlagsCommand(), "")
@@ -49,7 +51,7 @@ func main() {
 
     // Initialize the default logger to log to stderr.
     log.SetFlags(0)
-    log.SetPrefix("wire: ")
+    log.SetPrefix("wirex: ")
     log.SetOutput(os.Stderr)
 
     // TODO(rvangent): Use subcommands's VisitCommands instead of hardcoded map,
@@ -128,6 +130,11 @@ func (cmd *genCmd) SetFlags(f *flag.FlagSet) {
 }
 
 func (cmd *genCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+    startTime := time.Now()
+    defer func() {
+        log.Printf("total execution time: %v\n", time.Since(startTime))
+    }()
+
     wd, err := os.Getwd()
     if err != nil {
         log.Println("failed to get working directory: ", err)
