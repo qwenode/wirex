@@ -120,3 +120,61 @@ func BenchmarkLoad(b *testing.B) {
         }
     }
 }
+
+// BenchmarkGenerateWithLazyLoad benchmarks the lazy loading Generate function.
+func BenchmarkGenerateWithLazyLoad(b *testing.B) {
+    ctx := context.Background()
+    wd := filepath.Join("testdata", "Chain", "foo")
+    opts := &GenerateOptions{}
+
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        _, errs := GenerateWithLazyLoad(ctx, wd, nil, []string{"."}, opts)
+        if len(errs) > 0 {
+            b.Fatalf("GenerateWithLazyLoad failed: %v", errs)
+        }
+    }
+}
+
+// BenchmarkGenerateParallelWithLazyLoad benchmarks parallel + lazy loading.
+func BenchmarkGenerateParallelWithLazyLoad(b *testing.B) {
+    ctx := context.Background()
+    wd := filepath.Join("testdata", "Chain", "foo")
+    opts := &GenerateOptions{}
+    maxWorkers := runtime.GOMAXPROCS(0)
+
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        _, errs := GenerateParallelWithLazyLoad(ctx, wd, nil, []string{"."}, opts, maxWorkers)
+        if len(errs) > 0 {
+            b.Fatalf("GenerateParallelWithLazyLoad failed: %v", errs)
+        }
+    }
+}
+
+// BenchmarkLazyLoadPackage benchmarks the lazy package loading.
+func BenchmarkLazyLoadPackage(b *testing.B) {
+    ctx := context.Background()
+    wd := filepath.Join("testdata", "Chain", "foo")
+
+    // First load the initial packages
+    pkgs, errs := load(ctx, wd, nil, "", []string{"."})
+    if len(errs) > 0 {
+        b.Fatalf("load failed: %v", errs)
+    }
+
+    b.Run("WithLazyLoadEnabled", func(b *testing.B) {
+        for i := 0; i < b.N; i++ {
+            oc := newObjectCacheWithLazyLoad(pkgs, ctx, wd, nil)
+            // Try to get a package that's already loaded (fast path)
+            _, _ = oc.getPackage(pkgs[0].PkgPath)
+        }
+    })
+
+    b.Run("WithoutLazyLoad", func(b *testing.B) {
+        for i := 0; i < b.N; i++ {
+            oc := newObjectCache(pkgs)
+            _, _ = oc.getPackage(pkgs[0].PkgPath)
+        }
+    })
+}

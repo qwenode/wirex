@@ -600,6 +600,14 @@ type objectCache struct {
     packages map[string]*packages.Package
     objects  map[objRef]objCacheEntry
     hasher   typeutil.Hasher
+
+    // Lazy loading support
+    mu              sync.RWMutex
+    lazyLoadEnabled bool
+    loadCtx         context.Context
+    loadWd          string
+    loadEnv         []string
+    pendingPkgs     map[string]bool // packages that need to be loaded
 }
 
 type objRef struct {
@@ -617,10 +625,11 @@ func newObjectCache(pkgs []*packages.Package) *objectCache {
         panic("object cache must have packages to draw from")
     }
     oc := &objectCache{
-        fset:     pkgs[0].Fset,
-        packages: make(map[string]*packages.Package),
-        objects:  make(map[objRef]objCacheEntry),
-        hasher:   typeutil.MakeHasher(),
+        fset:        pkgs[0].Fset,
+        packages:    make(map[string]*packages.Package),
+        objects:     make(map[objRef]objCacheEntry),
+        hasher:      typeutil.MakeHasher(),
+        pendingPkgs: make(map[string]bool),
     }
     // Depth-first search of all dependencies to gather import path to
     // packages.Package mapping. go/packages guarantees that for a single
@@ -641,6 +650,161 @@ func newObjectCache(pkgs []*packages.Package) *objectCache {
     return oc
 }
 
+// newObjectCacheWithLazyLoad creates an object cache with lazy loading enabled.
+// This allows packages to be loaded on-demand rather than all at once,
+// which can significantly improve performance for large projects.
+func newObjectCacheWithLazyLoad(pkgs []*packages.Package, ctx context.Context, wd string, env []string) *objectCache {
+    oc := newObjectCache(pkgs)
+    oc.lazyLoadEnabled = true
+    oc.loadCtx = ctx
+    oc.loadWd = wd
+    oc.loadEnv = env
+    return oc
+}
+
+// EnableLazyLoad enables lazy loading for the object cache.
+func (oc *objectCache) EnableLazyLoad(ctx context.Context, wd string, env []string) {
+    oc.mu.Lock()
+    defer oc.mu.Unlock()
+    oc.lazyLoadEnabled = true
+    oc.loadCtx = ctx
+    oc.loadWd = wd
+    oc.loadEnv = env
+}
+
+// lazyLoadPackage loads a package on-demand if it's not already loaded.
+// This is useful for loading indirect dependencies only when needed.
+func (oc *objectCache) lazyLoadPackage(pkgPath string) (*packages.Package, error) {
+    // Fast path: check if already loaded
+    oc.mu.RLock()
+    if pkg, ok := oc.packages[pkgPath]; ok {
+        oc.mu.RUnlock()
+        return pkg, nil
+    }
+    if !oc.lazyLoadEnabled {
+        oc.mu.RUnlock()
+        return nil, fmt.Errorf("package %s not found and lazy loading is disabled", pkgPath)
+    }
+    oc.mu.RUnlock()
+
+    // Slow path: load the package
+    oc.mu.Lock()
+    defer oc.mu.Unlock()
+
+    // Double-check after acquiring write lock
+    if pkg, ok := oc.packages[pkgPath]; ok {
+        return pkg, nil
+    }
+
+    // Load the package with minimal mode for better performance
+    cfg := &packages.Config{
+        Context: oc.loadCtx,
+        Mode: packages.NeedName |
+            packages.NeedFiles |
+            packages.NeedCompiledGoFiles |
+            packages.NeedImports |
+            packages.NeedTypes |
+            packages.NeedSyntax |
+            packages.NeedTypesInfo,
+        Dir:        oc.loadWd,
+        Env:        oc.loadEnv,
+        BuildFlags: []string{"-tags=wireinject", "-mod=readonly"},
+    }
+
+    pkgs, err := packages.Load(cfg, pkgPath)
+    if err != nil {
+        return nil, fmt.Errorf("failed to lazy load package %s: %w", pkgPath, err)
+    }
+
+    if len(pkgs) == 0 {
+        return nil, fmt.Errorf("package %s not found", pkgPath)
+    }
+
+    // Check for package errors
+    for _, p := range pkgs {
+        if len(p.Errors) > 0 {
+            return nil, fmt.Errorf("errors loading package %s: %v", pkgPath, p.Errors[0])
+        }
+    }
+
+    pkg := pkgs[0]
+    oc.packages[pkgPath] = pkg
+
+    // Also cache any imports that were loaded
+    for _, imp := range pkg.Imports {
+        if _, exists := oc.packages[imp.PkgPath]; !exists {
+            oc.packages[imp.PkgPath] = imp
+        }
+    }
+
+    return pkg, nil
+}
+
+// getPackage returns a package, loading it lazily if necessary.
+func (oc *objectCache) getPackage(pkgPath string) (*packages.Package, error) {
+    oc.mu.RLock()
+    pkg, ok := oc.packages[pkgPath]
+    oc.mu.RUnlock()
+
+    if ok {
+        return pkg, nil
+    }
+
+    if oc.lazyLoadEnabled {
+        return oc.lazyLoadPackage(pkgPath)
+    }
+
+    return nil, fmt.Errorf("package %s not found", pkgPath)
+}
+
+// PreloadPackages preloads a list of packages in parallel for better performance.
+// This is useful when you know which packages will be needed ahead of time.
+func (oc *objectCache) PreloadPackages(pkgPaths []string) []error {
+    if !oc.lazyLoadEnabled {
+        return nil
+    }
+
+    var (
+        wg     sync.WaitGroup
+        mu     sync.Mutex
+        errors []error
+    )
+
+    // Filter out already loaded packages
+    var toLoad []string
+    oc.mu.RLock()
+    for _, path := range pkgPaths {
+        if _, ok := oc.packages[path]; !ok {
+            toLoad = append(toLoad, path)
+        }
+    }
+    oc.mu.RUnlock()
+
+    if len(toLoad) == 0 {
+        return nil
+    }
+
+    // Load packages in parallel with limited concurrency
+    sem := make(chan struct{}, 4) // limit concurrent loads
+    for _, pkgPath := range toLoad {
+        wg.Add(1)
+        go func(path string) {
+            defer wg.Done()
+            sem <- struct{}{}
+            defer func() { <-sem }()
+
+            if _, err := oc.lazyLoadPackage(path); err != nil {
+                mu.Lock()
+                errors = append(errors, err)
+                mu.Unlock()
+            }
+        }(pkgPath)
+    }
+
+    wg.Wait()
+    return errors
+}
+
 // get converts a Go object into a Wire structure. It may return a *Provider, an
 // *IfaceBinding, a *ProviderSet, a *Value, or a []*Field.
 func (oc *objectCache) get(obj types.Object) (val interface{}, errs []error) {
@@ -659,7 +823,10 @@ func (oc *objectCache) get(obj types.Object) (val interface{}, errs []error) {
     }()
     switch obj := obj.(type) {
     case *types.Var:
-        spec := oc.varDecl(obj)
+        spec, err := oc.varDeclWithLazyLoad(obj)
+        if err != nil {
+            return nil, []error{err}
+        }
         if spec == nil || len(spec.Values) == 0 {
             return nil, []error{fmt.Errorf("%v is not a provider or a provider set", obj)}
         }
@@ -670,7 +837,11 @@ func (oc *objectCache) get(obj types.Object) (val interface{}, errs []error) {
             }
         }
         pkgPath := obj.Pkg().Path()
-        return oc.processExpr(oc.packages[pkgPath].TypesInfo, pkgPath, spec.Values[i], obj.Name())
+        pkg, err := oc.getPackage(pkgPath)
+        if err != nil {
+            return nil, []error{err}
+        }
+        return oc.processExpr(pkg.TypesInfo, pkgPath, spec.Values[i], obj.Name())
     case *types.Func:
         return processFuncProvider(oc.fset, obj)
     default:
@@ -679,10 +850,25 @@ func (oc *objectCache) get(obj types.Object) (val interface{}, errs []error) {
 }
 
 // varDecl finds the declaration that defines the given variable.
+// Deprecated: Use varDeclWithLazyLoad instead for lazy loading support.
 func (oc *objectCache) varDecl(obj *types.Var) *ast.ValueSpec {
+    spec, _ := oc.varDeclWithLazyLoad(obj)
+    return spec
+}
+
+// varDeclWithLazyLoad finds the declaration that defines the given variable,
+// loading the package lazily if necessary.
+func (oc *objectCache) varDeclWithLazyLoad(obj *types.Var) (*ast.ValueSpec, error) {
     // TODO(light): Walk files to build object -> declaration mapping, if more performant.
     // Recommended by https://golang.org/s/types-tutorial
-    pkg := oc.packages[obj.Pkg().Path()]
+    pkgPath := obj.Pkg().Path()
+    pkg, err := oc.getPackage(pkgPath)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get package %s: %w", pkgPath, err)
+    }
+    if pkg == nil {
+        return nil, fmt.Errorf("package %s not found", pkgPath)
+    }
     pos := obj.Pos()
     for _, f := range pkg.Syntax {
         tokenFile := oc.fset.File(f.Pos())
@@ -690,12 +876,12 @@ func (oc *objectCache) varDecl(obj *types.Var) *ast.ValueSpec {
             path, _ := astutil.PathEnclosingInterval(f, pos, pos)
             for _, node := range path {
                 if spec, ok := node.(*ast.ValueSpec); ok {
-                    return spec
+                    return spec, nil
                 }
             }
         }
     }
-    return nil
+    return nil, nil
 }
 
 // processExpr converts an expression into a Wire structure. It may return a

@@ -105,6 +105,7 @@ type genCmd struct {
     tags           string
     parallel       bool
     workers        int
+    lazyLoad       bool
 }
 
 func (*genCmd) Name() string { return "gen" }
@@ -119,6 +120,8 @@ func (*genCmd) Usage() string {
   If no packages are listed, it defaults to ".".
 
   Use -parallel for faster generation on large codebases with many packages.
+  Use -lazy for lazy loading of dependencies (reduces initial load time).
+  Combine -parallel and -lazy for maximum performance on very large projects.
 `
 }
 func (cmd *genCmd) SetFlags(f *flag.FlagSet) {
@@ -127,6 +130,7 @@ func (cmd *genCmd) SetFlags(f *flag.FlagSet) {
     f.StringVar(&cmd.tags, "tags", "", "append build tags to the default wirebuild")
     f.BoolVar(&cmd.parallel, "parallel", false, "enable parallel processing for faster generation on large codebases")
     f.IntVar(&cmd.workers, "workers", 0, "number of parallel workers (default: number of CPUs, only used with -parallel)")
+    f.BoolVar(&cmd.lazyLoad, "lazy", false, "enable lazy loading of dependencies (reduces initial load time for large projects)")
 }
 
 func (cmd *genCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
@@ -152,9 +156,22 @@ func (cmd *genCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...interfa
     var outs []wire.GenerateResult
     var errs []error
 
-    if cmd.parallel {
+    // Select the appropriate generation strategy based on flags
+    switch {
+    case cmd.parallel && cmd.lazyLoad:
+        // Maximum performance: parallel + lazy loading
+        log.Println("using parallel processing with lazy loading")
+        outs, errs = wire.GenerateParallelWithLazyLoad(ctx, wd, os.Environ(), packages(f), opts, cmd.workers)
+    case cmd.parallel:
+        // Parallel processing only
+        log.Println("using parallel processing")
         outs, errs = wire.GenerateParallel(ctx, wd, os.Environ(), packages(f), opts, cmd.workers)
-    } else {
+    case cmd.lazyLoad:
+        // Lazy loading only
+        log.Println("using lazy loading")
+        outs, errs = wire.GenerateWithLazyLoad(ctx, wd, os.Environ(), packages(f), opts)
+    default:
+        // Standard generation
         outs, errs = wire.Generate(ctx, wd, os.Environ(), packages(f), opts)
     }
 

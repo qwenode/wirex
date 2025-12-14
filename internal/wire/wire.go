@@ -200,6 +200,82 @@ func GenerateOptimized(ctx context.Context, wd string, env []string, patterns []
     return generated, nil
 }
 
+// GenerateWithLazyLoad performs dependency injection with lazy package loading.
+// Instead of loading all transitive dependencies upfront, packages are loaded
+// on-demand as they are needed. This can significantly reduce initial load time
+// for large projects where only a subset of dependencies are actually used.
+//
+// This function is recommended for very large projects with deep dependency trees
+// where the upfront loading cost is significant.
+//
+// Note: This may result in slightly slower individual package processing due to
+// on-demand loading, but the overall time can be reduced if not all dependencies
+// are needed.
+func GenerateWithLazyLoad(ctx context.Context, wd string, env []string, patterns []string, opts *GenerateOptions) ([]GenerateResult, []error) {
+    if opts == nil {
+        opts = &GenerateOptions{}
+    }
+    pkgs, errs := load(ctx, wd, env, opts.Tags, patterns)
+    if len(errs) > 0 {
+        return nil, errs
+    }
+    generated := make([]GenerateResult, len(pkgs))
+    for i, pkg := range pkgs {
+        generated[i] = generateSinglePackageWithLazyLoad(ctx, wd, env, pkg, opts)
+    }
+    return generated, nil
+}
+
+// GenerateParallelWithLazyLoad combines parallel processing with lazy loading
+// for maximum performance on very large projects.
+//
+// maxWorkers controls the number of parallel workers. If maxWorkers <= 0,
+// it defaults to runtime.GOMAXPROCS(0).
+func GenerateParallelWithLazyLoad(ctx context.Context, wd string, env []string, patterns []string, opts *GenerateOptions, maxWorkers int) ([]GenerateResult, []error) {
+    if opts == nil {
+        opts = &GenerateOptions{}
+    }
+    pkgs, errs := load(ctx, wd, env, opts.Tags, patterns)
+    if len(errs) > 0 {
+        return nil, errs
+    }
+
+    if maxWorkers <= 0 {
+        maxWorkers = runtime.GOMAXPROCS(0)
+    }
+    if maxWorkers > len(pkgs) {
+        maxWorkers = len(pkgs)
+    }
+
+    generated := make([]GenerateResult, len(pkgs))
+
+    type workItem struct {
+        index int
+        pkg   *packages.Package
+    }
+
+    workCh := make(chan workItem, len(pkgs))
+    var wg sync.WaitGroup
+
+    for w := 0; w < maxWorkers; w++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for item := range workCh {
+                generated[item.index] = generateSinglePackageWithLazyLoad(ctx, wd, env, item.pkg, opts)
+            }
+        }()
+    }
+
+    for i, pkg := range pkgs {
+        workCh <- workItem{index: i, pkg: pkg}
+    }
+    close(workCh)
+
+    wg.Wait()
+    return generated, nil
+}
+
 // generateSinglePackage generates code for a single package.
 // This is extracted to enable parallel processing.
 func generateSinglePackage(pkg *packages.Package, opts *GenerateOptions) GenerateResult {
@@ -274,6 +350,109 @@ func generateSinglePackageOptimized(pkg *packages.Package, opts *GenerateOptions
     }
     result.Content = goSrc
     return result
+}
+
+// generateSinglePackageWithLazyLoad generates code for a single package using
+// lazy loading for dependencies.
+func generateSinglePackageWithLazyLoad(ctx context.Context, wd string, env []string, pkg *packages.Package, opts *GenerateOptions) GenerateResult {
+    result := GenerateResult{
+        PkgPath: pkg.PkgPath,
+    }
+
+    outDir, err := detectOutputDir(pkg.GoFiles)
+    if err != nil {
+        result.Errs = append(result.Errs, err)
+        return result
+    }
+    result.OutputPath = filepath.Join(outDir, opts.PrefixOutputFile+"wire_gen.go")
+
+    g := newGen(pkg)
+    // Use lazy loading for injector generation
+    injectorFiles, errs := generateInjectorsWithLazyLoad(ctx, wd, env, g, pkg)
+    if len(errs) > 0 {
+        result.Errs = errs
+        return result
+    }
+
+    copyNonInjectorDecls(g, injectorFiles, pkg.TypesInfo)
+    goSrc := g.frame(opts.Tags)
+
+    if len(opts.Header) > 0 {
+        goSrc = append(opts.Header, goSrc...)
+    }
+
+    fmtSrc, err := format.Source(goSrc)
+    if err != nil {
+        result.Errs = append(result.Errs, err)
+    } else {
+        goSrc = fmtSrc
+    }
+    result.Content = goSrc
+    return result
+}
+
+// generateInjectorsWithLazyLoad generates injectors using lazy package loading.
+func generateInjectorsWithLazyLoad(ctx context.Context, wd string, env []string, g *gen, pkg *packages.Package) (injectorFiles []*ast.File, _ []error) {
+    // Create object cache with lazy loading enabled
+    oc := newObjectCacheWithLazyLoad([]*packages.Package{pkg}, ctx, wd, env)
+    injectorFiles = make([]*ast.File, 0, len(pkg.Syntax))
+    ec := new(errorCollector)
+
+    for _, f := range pkg.Syntax {
+        for _, decl := range f.Decls {
+            fn, ok := decl.(*ast.FuncDecl)
+            if !ok {
+                continue
+            }
+            buildCall, err := findInjectorBuild(pkg.TypesInfo, fn)
+            if err != nil {
+                ec.add(err)
+                continue
+            }
+            if buildCall == nil {
+                continue
+            }
+            if len(injectorFiles) == 0 || injectorFiles[len(injectorFiles)-1] != f {
+                name := filepath.Base(g.pkg.Fset.File(f.Pos()).Name())
+                g.p("// Injectors from %s:\n\n", name)
+                injectorFiles = append(injectorFiles, f)
+            }
+            sig := pkg.TypesInfo.ObjectOf(fn.Name).Type().(*types.Signature)
+            ins, _, err := injectorFuncSignature(sig)
+            if err != nil {
+                if w, ok := err.(*wireErr); ok {
+                    ec.add(notePosition(w.position, fmt.Errorf("inject %s: %v", fn.Name.Name, w.error)))
+                } else {
+                    ec.add(notePosition(g.pkg.Fset.Position(fn.Pos()), fmt.Errorf("inject %s: %v", fn.Name.Name, err)))
+                }
+                continue
+            }
+            injectorArgs := &InjectorArgs{
+                Name:  fn.Name.Name,
+                Tuple: ins,
+                Pos:   fn.Pos(),
+            }
+            set, errs := oc.processNewSet(pkg.TypesInfo, pkg.PkgPath, buildCall, injectorArgs, "")
+            if len(errs) > 0 {
+                ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
+                continue
+            }
+            if errs := g.inject(fn.Pos(), fn.Name.Name, sig, set, fn.Doc); len(errs) > 0 {
+                ec.add(errs...)
+                continue
+            }
+        }
+
+        for _, impt := range f.Imports {
+            if impt.Name != nil && impt.Name.Name == "_" {
+                g.anonImports[impt.Path.Value] = true
+            }
+        }
+    }
+    if len(ec.errors) > 0 {
+        return nil, ec.errors
+    }
+    return injectorFiles, nil
 }
 
 func detectOutputDir(paths []string) (string, error) {
